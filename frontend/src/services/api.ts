@@ -2,8 +2,20 @@ import { ApiResponse, Item, ItemAnalysisResponse, ItemMatch, Claim, AuditLog, Cl
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '') + '/api';
 
+async function parseJsonResponse<T>(res: Response): Promise<ApiResponse<T>> {
+  const text = await res.text();
+  if (!text || !text.trim()) {
+    throw new Error(`Server returned empty response (HTTP ${res.status}). Ensure the backend server on port 8080 is running.`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(text.length < 200 ? text : `Server returned non-JSON response (HTTP ${res.status})`);
+  }
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
-  const json: ApiResponse<T> = await res.json();
+  const json: ApiResponse<T> = await parseJsonResponse<T>(res);
   if (!res.ok || !json.success) {
     throw new Error(json.message || `Request failed with status ${res.status}`);
   }
@@ -24,7 +36,7 @@ export const api = {
       credentials: 'include',
       body: JSON.stringify({ email, fullName, role }),
     });
-    const json: ApiResponse<RequestCodeResponse> = await res.json();
+    const json: ApiResponse<RequestCodeResponse> = await parseJsonResponse<RequestCodeResponse>(res);
     if (!res.ok || !json.success) {
       throw new Error(json.message || 'Failed to send verification code');
     }
@@ -45,7 +57,7 @@ export const api = {
     try {
       const res = await fetch(`${API_BASE}/auth/me`, { credentials: 'include' });
       if (res.status === 401 || !res.ok) return null;
-      const json: ApiResponse<AuthUser> = await res.json();
+      const json: ApiResponse<AuthUser> = await parseJsonResponse<AuthUser>(res);
       return json.success ? json.data : null;
     } catch {
       return null;

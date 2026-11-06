@@ -16,6 +16,8 @@ data/*.db-shm
 *.db
 uploads/*
 !uploads/.gitkeep
+backend/uploads/*
+!backend/uploads/.gitkeep
 
 # Node & Frontend
 node_modules/

@@ -15,6 +15,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.*;
+import javax.imageio.ImageIO;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 
 @Service
 public class GeminiItemVisionService implements ItemVisionService {
@@ -24,7 +30,7 @@ public class GeminiItemVisionService implements ItemVisionService {
     @Value("${gemini.api-key:}")
     private String apiKey;
 
-    @Value("${gemini.model:gemini-2.0-flash}")
+    @Value("${gemini.model:gemini-3-flash-preview}")
     private String modelName;
 
     private final ObjectMapper objectMapper;
@@ -55,7 +61,8 @@ public class GeminiItemVisionService implements ItemVisionService {
         }
 
         try {
-            String base64Image = Base64.getEncoder().encodeToString(imageBytes);
+            byte[] payloadBytes = optimizeImageForVision(imageBytes);
+            String base64Image = Base64.getEncoder().encodeToString(payloadBytes);
             String effectiveMimeType = (mimeType != null && !mimeType.isBlank()) ? mimeType : "image/jpeg";
 
             String prompt = """
@@ -94,7 +101,15 @@ public class GeminiItemVisionService implements ItemVisionService {
 
             String requestBodyJson = objectMapper.writeValueAsString(requestBodyMap);
 
-            String[] modelCandidates = new String[] { modelName.trim(), "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-flash-latest" };
+            List<String> modelCandidates = new ArrayList<>();
+            if (modelName != null && !modelName.isBlank()) {
+                modelCandidates.add(modelName.trim());
+            }
+            if (!modelCandidates.contains("gemini-3-flash-preview")) modelCandidates.add("gemini-3-flash-preview");
+            if (!modelCandidates.contains("gemini-3.1-flash-lite")) modelCandidates.add("gemini-3.1-flash-lite");
+            if (!modelCandidates.contains("gemini-flash-lite-latest")) modelCandidates.add("gemini-flash-lite-latest");
+            if (!modelCandidates.contains("gemini-3.8-flash")) modelCandidates.add("gemini-3.8-flash");
+
             HttpResponse<String> response = null;
             String usedModel = modelName;
 
@@ -108,29 +123,36 @@ public class GeminiItemVisionService implements ItemVisionService {
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create(url))
                         .header("Content-Type", "application/json")
-                        .timeout(Duration.ofSeconds(45))
+                        .timeout(Duration.ofSeconds(18))
                         .POST(HttpRequest.BodyPublishers.ofString(requestBodyJson))
                         .build();
 
-                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() == 200) {
-                    break;
-                }
-                logger.warn("Model {} returned HTTP {}, checking alternate model if available...", candidateModel, response.statusCode());
-                if (response.statusCode() != 404) {
-                    // Not a model not found error, don't cascade on auth or bad request
-                    break;
+                try {
+                    response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                    if (response.statusCode() == 200) {
+                        break;
+                    }
+                    logger.warn("Model {} returned HTTP {}, checking alternate model if available...", candidateModel, response.statusCode());
+                    if (response.statusCode() == 400 || response.statusCode() == 401 || response.statusCode() == 403) {
+                        // Auth or malformed request, don't cascade
+                        break;
+                    }
+                } catch (Exception ex) {
+                    logger.warn("Request to model {} timed out or encountered network issue: {}. Attempting fallback...",
+                            candidateModel, ex.getMessage());
                 }
             }
 
-            if (response.statusCode() != 200) {
-                logger.error("Gemini API returned status {}: {}", response.statusCode(), response.body());
-                if (response.statusCode() == 429) {
+            if (response == null || response.statusCode() != 200) {
+                int status = response != null ? response.statusCode() : 504;
+                String body = response != null ? response.body() : "Timeout";
+                logger.error("Gemini API returned status {}: {}", status, body);
+                if (status == 429) {
                     throw new AiServiceException("Gemini AI API rate limit reached. Please wait a moment or fill details manually.");
-                } else if (response.statusCode() == 400 || response.statusCode() == 403) {
-                    throw new AiServiceException("Gemini AI API authorization or request failed (HTTP " + response.statusCode() + "). Please check your GEMINI_API_KEY.");
+                } else if (status == 400 || status == 403) {
+                    throw new AiServiceException("Gemini AI API authorization or request failed (HTTP " + status + "). Please check your GEMINI_API_KEY.");
                 } else {
-                    throw new AiServiceException("Gemini AI API returned error HTTP " + response.statusCode());
+                    throw new AiServiceException("Gemini AI API returned error HTTP " + status);
                 }
             }
 
@@ -188,7 +210,7 @@ public class GeminiItemVisionService implements ItemVisionService {
             double conf = parsedJson.path("confidence").asDouble(0.85);
             result.setConfidence(Math.max(0.1, Math.min(1.0, conf)));
             result.setFallback(false);
-            result.setNote("Analyzed with " + modelName);
+            result.setNote("Analyzed with " + usedModel);
 
             return result;
 
@@ -197,6 +219,44 @@ public class GeminiItemVisionService implements ItemVisionService {
         } catch (Exception e) {
             logger.error("Error during image AI analysis", e);
             throw new AiServiceException("Failed to analyze image with AI: " + e.getMessage(), e);
+        }
+    }
+
+    private byte[] optimizeImageForVision(byte[] originalBytes) {
+        if (originalBytes == null || originalBytes.length < 500_000) {
+            // Already under 500KB, no need to downscale
+            return originalBytes;
+        }
+        try {
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(originalBytes));
+            if (img == null) {
+                return originalBytes;
+            }
+            int maxDim = 1200;
+            int width = img.getWidth();
+            int height = img.getHeight();
+            if (width <= maxDim && height <= maxDim) {
+                return originalBytes;
+            }
+            double scale = Math.min((double) maxDim / width, (double) maxDim / height);
+            int newWidth = Math.max(1, (int) (width * scale));
+            int newHeight = Math.max(1, (int) (height * scale));
+
+            BufferedImage resized = new BufferedImage(newWidth, newHeight, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = resized.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.drawImage(img, 0, 0, newWidth, newHeight, null);
+            g.dispose();
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ImageIO.write(resized, "jpg", baos);
+            byte[] optimized = baos.toByteArray();
+            logger.info("Optimized vision payload from {} bytes to {} bytes ({}x{} -> {}x{})",
+                    originalBytes.length, optimized.length, width, height, newWidth, newHeight);
+            return optimized;
+        } catch (Exception e) {
+            logger.warn("Could not optimize image for vision, using original: {}", e.getMessage());
+            return originalBytes;
         }
     }
 }

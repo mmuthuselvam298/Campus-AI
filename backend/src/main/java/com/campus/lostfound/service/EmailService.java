@@ -73,7 +73,7 @@ public class EmailService {
                 emailDispatched = true;
                 logger.info("Verification code email successfully dispatched to {}", toEmail);
             } catch (Exception e) {
-                logger.warn("Could not send SMTP email to {}: {}. Dev OTP enabled: {}", toEmail, e.getMessage(), devOtpEnabled);
+                logger.error("Could not send SMTP email to {}: {}", toEmail, e.getMessage(), e);
                 if (!devOtpEnabled) {
                     throw new RuntimeException("Email delivery service is currently unavailable. Please contact system support.");
                 }
